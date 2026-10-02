@@ -1,0 +1,249 @@
+import asyncio
+import math
+from aiogram import Bot, Dispatcher, F, types
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
+
+TOKEN = "8853624887:AAG4rfcOE4h62xFKu4Yx6CwZaEorxVzHxu4"
+ADMIN_ID = 7473166640
+
+bot = Bot(token=TOKEN)
+dp = Dispatcher()
+
+PACK_INFO = {
+ "20": {"sheets": 25, "area": 12.5, "price_pack": 625},
+ "30": {"sheets": 16, "area": 8.0, "price_pack": 608},
+ "50": {"sheets": 10, "area": 5.0, "price_pack": 600},
+ "100": {"sheets": 5, "area": 2.5, "price_pack": 600},
+}
+
+PRICE_GLUE = 180
+PRICE_ARM = 210
+
+CATALOG = {
+ "penoplast": {
+ "title": "📦 Пінопласт (пачки)",
+ "items": {
+ "p_20": {"name": "Пінопласт 20мм (пачка 12.5 м²)", "price": 625},
+ "p_30": {"name": "Пінопласт 30мм (пачка 8 м²)", "price": 608},
+ "p_50": {"name": "Пінопласт 50мм (пачка 5 м²)", "price": 600},
+ "p_100": {"name": "Пінопласт 100мм (пачка 2.5 м²)", "price": 600},
+ }
+ },
+ "smesi": {
+ "title": "🧱 Клеї та суміші",
+ "items": {
+ "sm_glue": {"name": "Клей для приклеювання (25 кг)", "price": PRICE_GLUE},
+ "sm_arm": {"name": "Суміш армувальна (25 кг)", "price": PRICE_ARM},
+ }
+ }
+}
+
+CARTS = {}
+
+class CalcState(StatesGroup):
+ waiting_for_area = State()
+ waiting_for_thickness = State()
+
+class OrderState(StatesGroup):
+ waiting_for_phone = State()
+ waiting_for_address = State()
+
+def get_main_kb():
+ kb = ReplyKeyboardBuilder()
+ kb.button(text="📐 Калькулятор матеріалів")
+ kb.button(text="📦 Каталог товарів")
+ kb.button(text="🛒 Кошик")
+ kb.button(text="📞 Зв'язок з менеджером")
+ kb.adjust(2, 2)
+ return kb.as_markup(resize_keyboard=True)
+
+@dp.message(Command("start"))
+async def start(message: types.Message):
+ await message.answer(
+ f"Вітаємо, {message.from_user.first_name}! 🏗\n"
+ "Склад будматеріалів (м. Біла Церква) на зв'язку.\n\n"
+ "Тут можна прорахувати об'єм через Калькулятор або обрати товари в Каталозі.",
+ reply_markup=get_main_kb(),
+ parse_mode="HTML"
+ )
+
+@dp.message(F.text == "📐 Калькулятор матеріалів")
+async def start_calc(message: types.Message, state: FSMContext):
+ await message.answer("Вкажіть площу стін під утеплення в м² (наприклад: 75):", parse_mode="HTML")
+ await state.set_state(CalcState.waiting_for_area)
+
+@dp.message(CalcState.waiting_for_area)
+async def get_area(message: types.Message, state: FSMContext):
+ try:
+ area = float(message.text.replace(",", "."))
+ if area <= 0:
+ raise ValueError
+ except ValueError:
+ return await message.answer("Введіть число більше 0:")
+
+ await state.update_data(area=area)
+ kb = InlineKeyboardBuilder()
+ kb.button(text="20 мм", callback_data="thick_20")
+ kb.button(text="30 мм", callback_data="thick_30")
+ kb.button(text="50 мм", callback_data="thick_50")
+ kb.button(text="100 мм", callback_data="thick_100")
+ kb.adjust(2, 2)
+ await message.answer(f"Площа: {area} м².\nОберіть товщину пінопласту:", reply_markup=kb.as_markup(), parse_mode="HTML")
+ await state.set_state(CalcState.waiting_for_thickness)
+
+@dp.callback_query(CalcState.waiting_for_thickness, F.data.startswith("thick_"))
+async def finish_calc(call: types.CallbackQuery, state: FSMContext):
+ thick = call.data.split("_")[1]
+ data = await state.get_data()
+ area = data["area"]
+
+ pack = PACK_INFO[thick]
+ area_with_waste = area * 1.05
+ packs_count = math.ceil(area_with_waste / pack["area"])
+ total_sheets = packs_count * (25 if thick == "20" else 16 if thick == "30" else 10 if thick == "50" else 5)
+ glue_bags = math.ceil((area_with_waste * 5) / 25)
+ arm_bags = math.ceil((area_with_waste * 4.5) / 25)
+
+ sum_peno = packs_count * pack["price_pack"]
+ sum_glue = glue_bags * PRICE_GLUE
+ sum_arm = arm_bags * PRICE_ARM
+ total = sum_peno + sum_glue + sum_arm
+
+ await state.update_data(thick=thick, packs=packs_count, glue=glue_bags, arm=arm_bags)
+
+ res_text = (
+ f"📊 Розрахунок на {area} м² ({thick}мм):\n\n"
+ f"▫️ Пінопласт: {packs_count} пач. ({total_sheets} листів) = {sum_peno} грн\n"
+ f"▫️ Клей: {glue_bags} міш. = {sum_glue} грн\n"
+ f"▫️ Армування: {arm_bags} міш. = {sum_arm} грн\n\n"
+ f"💰 Разом: {total} грн"
+ )
+ kb = InlineKeyboardBuilder()
+ kb.button(text="🛒 Додати все в кошик", callback_data="add_calc_to_cart")
+ await call.message.answer(res_text, reply_markup=kb.as_markup(), parse_mode="HTML")
+
+@dp.callback_query(F.data == "add_calc_to_cart")
+async def add_calc_to_cart(call: types.CallbackQuery, state: FSMContext):
+ data = await state.get_data()
+ uid = call.from_user.id
+ if uid not in CARTS:
+ CARTS[uid] = {}
+ CARTS[uid][f"p_{data['thick']}"] = CARTS[uid].get(f"p_{data['thick']}", 0) + data["packs"]
+ CARTS[uid]["sm_glue"] = CARTS[uid].get("sm_glue", 0) + data["glue"]
+ CARTS[uid]["sm_arm"] = CARTS[uid].get("sm_arm", 0) + data["arm"]
+ await call.answer("Додано!")
+ await call.message.answer("Матеріали в кошику! Тисніть «🛒 Кошик» для оформлення.")
+ await state.clear()
+
+@dp.message(F.text == "📦 Каталог товарів")
+async def show_categories(message: types.Message):
+ kb = InlineKeyboardBuilder()
+ for cat_id, cat_data in CATALOG.items():
+ kb.button(text=cat_data["title"], callback_data=f"cat_{cat_id}")
+ kb.adjust(1)
+ await message.answer("Оберіть категорію:", reply_markup=kb.as_markup())
+
+@dp.callback_query(F.data.startswith("cat_"))
+async def show_items(call: types.CallbackQuery):
+ cat_id = call.data.split("_")[1]
+ cat = CATALOG[cat_id]
+ kb = InlineKeyboardBuilder()
+ for item_id, item in cat["items"].items():
+ kb.button(text=f"{item['name']} — {item['price']} грн", callback_data=f"add_{cat_id}_{item_id}")
+ kb.adjust(1)
+ await call.message.edit_text(f"Розділ: {cat['title']}", reply_markup=kb.as_markup(), parse_mode="HTML")
+
+@dp.callback_query(F.data.startswith("add_"))
+async def add_item_cart(call: types.CallbackQuery):
+ parts = call.data.split("_")
+ item_id = f"{parts[2]}_{parts[3]}"
+ uid = call.from_user.id
+ if uid not in CARTS:
+ CARTS[uid] = {}
+ CARTS[uid][item_id] = CARTS[uid].get(item_id, 0) + 1
+ await call.answer("+1 шт додано")
+
+@dp.message(F.text == "🛒 Кошик")
+async def view_cart(message: types.Message):
+ uid = message.from_user.id
+ cart = CARTS.get(uid, {})
+ if not cart or sum(cart.values()) == 0:
+ return await message.answer("Кошик порожній.")
+
+ total_sum = 0
+ text = "🛒 Ваше замовлення:\n\n"
+ for cat in CATALOG.values():
+ for item_id, item in cat["items"].items():
+ if item_id in cart and cart[item_id] > 0:
+ cnt = cart[item_id]
+ cost = cnt * item["price"]
+ total_sum += cost
+ text += f"▪️ {item['name']} x {cnt} шт = {cost} грн\n"
+
+ text += f"\nРазом: {total_sum} грн"
+ kb = InlineKeyboardBuilder()
+ kb.button(text="✅ Оформити замовлення", callback_data="checkout")
+ kb.button(text="🗑 Очистити", callback_data="clear_cart")
+ kb.adjust(2)
+ await message.answer(text, reply_markup=kb.as_markup(), parse_mode="HTML")
+
+@dp.callback_query(F.data == "clear_cart")
+async def clear_cart(call: types.CallbackQuery):
+ CARTS[call.from_user.id] = {}
+ await call.message.edit_text("Кошик очищено.")
+
+@dp.callback_query(F.data == "checkout")
+async def checkout(call: types.CallbackQuery, state: FSMContext):
+ await call.message.answer("Вкажіть номер телефону:")
+ await state.set_state(OrderState.waiting_for_phone)
+
+@dp.message(OrderState.waiting_for_phone)
+async def get_phone(message: types.Message, state: FSMContext):
+ await state.update_data(phone=message.text)
+ await message.answer("Вкажіть адресу доставки по Білій Церкві/району (або самовивіз):")
+ await state.set_state(OrderState.waiting_for_address)
+
+@dp.message(OrderState.waiting_for_address)
+async def get_address(message: types.Message, state: FSMContext):
+ data = await state.get_data()
+ phone = data["phone"]
+ address = message.text
+ uid = message.from_user.id
+ cart = CARTS.get(uid, {})
+
+ total_sum = 0
+ items_text = ""
+ for cat in CATALOG.values():
+ for item_id, item in cat["items"].items():
+ if item_id in cart and cart[item_id] > 0:
+ cnt = cart[item_id]
+ cost = cnt * item["price"]
+ total_sum += cost
+ items_text += f"▫️ {item['name']} x {cnt} шт ({cost} грн)\n"
+
+ await message.answer("✅ Замовлення прийнято! Менеджер зв'яжеться з вами.", reply_markup=get_main_kb())
+
+ admin_msg = (
+ f"🚨 НОВЕ ЗАМОВЛЕННЯ!\n\n"
+ f"👤 Клієнт: {message.from_user.full_name} (@{message.from_user.username or 'немає'})\n"
+ f"📞 Тел: {phone}\n"
+ f"📍 Адреса: {address}\n\n"
+ f"Товари:\n{items_text}\n"
+ f"💰 Сума: {total_sum} грн"
+ )
+ await bot.send_message(ADMIN_ID, admin_msg, parse_mode="HTML")
+ CARTS[uid] = {}
+ await state.clear()
+
+@dp.message(F.text == "📞 Зв'язок з менеджером")
+async def contact(message: types.Message):
+ await message.answer("З усіх питань та замовлень звертайтесь за телефоном або в приватні повідомлення менеджера.")
+
+async def main():
+ await dp.start_polling(bot)
+
+if __name__ == "__main__":
+ asyncio.run(main())
